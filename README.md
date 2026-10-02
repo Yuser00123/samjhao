@@ -56,6 +56,8 @@ Free instances sleep after 15 min of inactivity; the first request after that ta
 
 ## Features
 
+- **`GET /health`** — liveness probe returning `{"status": "ok", "service": "samjhao", "model": "…", "uptime_seconds": n}`; used by Render's health check (`healthCheckPath` in `render.yaml`) and handy for uptime monitors.
+
 - **🧠 Samjhao** — three depths (*Bilkul basic* / *Exam ke liye* / *Deep dive*), three languages (Hinglish / Hindi / English). Streams the answer. Fixed structure: explanation → key terms (English → Hindi) → 3 memory hooks → one exam question with model answer.
 - **📄 PDF in** — pick a page range from a text-based PDF (scanned PDFs: paste the text instead).
 - **📝 Quiz** — 5 MCQs generated as strict JSON from the same material, scored instantly with a *why* for every question.
@@ -64,7 +66,7 @@ Free instances sleep after 15 min of inactivity; the first request after that ta
 ## Project layout
 
 ```
-app.py        Gradio UI + handlers (streaming, quiz scoring, diary wiring)
+app.py        Gradio UI + handlers, mounted on FastAPI (adds GET /health)
 llm.py        provider-agnostic chat/stream/JSON — OpenAI-compatible, google-genai, or mock
 prompts.py    the persona and the three jobs (explain / quiz / revision)
 extract.py    PDF → text, truncation, topic guessing

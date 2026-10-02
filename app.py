@@ -340,12 +340,41 @@ with gr.Blocks(title="Samjhao") as demo:
     up_json.upload(import_json, inputs=[up_json, diary_state], outputs=diary_outs)
 
 
+# ----------------------------------------------------------------------------- server
+# Gradio runs on FastAPI. We mount it on our own FastAPI app so we can add plain HTTP
+# endpoints next to the UI — e.g. /health for Render's health checks and uptime monitors.
+import time  # noqa: E402
+
+from fastapi import FastAPI  # noqa: E402
+
+STARTED_AT = time.time()
+
+api = FastAPI(title="Samjhao", docs_url=None, redoc_url=None, openapi_url=None)
+
+
+@api.get("/health")
+def health():
+    """Liveness probe: 200 + {"status": "ok"} whenever the process is up."""
+    return {
+        "status": "ok",
+        "service": "samjhao",
+        "model": llm.describe(),
+        "uptime_seconds": int(time.time() - STARTED_AT),
+    }
+
+
+demo.queue(default_concurrency_limit=4)
+app = gr.mount_gradio_app(
+    api,
+    demo,
+    path="/",
+    theme=gr.themes.Soft(primary_hue="orange", neutral_hue="stone"),
+    css=CSS,
+    pwa=True,  # lets your friend "Add to Home Screen" on their phone
+    show_error=True,
+)
+
 if __name__ == "__main__":
-    demo.queue(default_concurrency_limit=4).launch(
-        server_name="0.0.0.0",
-        server_port=int(os.getenv("PORT", "7860")),
-        theme=gr.themes.Soft(primary_hue="orange", neutral_hue="stone"),
-        css=CSS,
-        pwa=True,  # lets your friend "Add to Home Screen" on their phone
-        show_error=True,
-    )
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "7860")))
