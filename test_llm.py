@@ -44,3 +44,30 @@ try:
     print(f"JSON mode: {data} ✅")
 except Exception as err:  # noqa: BLE001
     print(f"JSON mode: ⚠️ {err}  (quiz may still work — the prompt also asks for JSON)")
+
+# ── Optional: python test_llm.py --probe-thinking ─────────────────────────────
+# Gemma 4 on the Gemini API "thinks" before answering (slow, and the thoughts arrive
+# as <thought>…</thought> text — Samjhao strips them). This probe tries a few
+# LLM_EXTRA_BODY values and reports latency + whether a thought block appeared, so
+# you can pick the fastest setting for your provider and put it in .env.
+if "--probe-thinking" in sys.argv and llm.PROVIDER == "openai":
+    import json
+    candidates = [
+        None,
+        {"reasoning_effort": "none"},
+        {"reasoning_effort": "low"},
+        {"google": {"thinking_config": {"thinking_level": "minimal"}}},
+        {"google": {"thinking_config": {"thinking_budget": 0}}},
+    ]
+    msgs = [{"role": "user", "content": "Ek line me batao: Ohm's law kya hai? Hinglish me."}]
+    print("\nProbing thinking controls (each call may take up to ~90s)…")
+    for body in candidates:
+        llm.EXTRA_BODY = body
+        t0 = time.time()
+        try:
+            raw = llm.chat(msgs, max_tokens=1024, strip=False)
+            saw = "<thought>" in raw or "<think>" in raw
+            print(f"  {json.dumps(body):70s} → {time.time() - t0:5.1f}s  thought={'yes' if saw else 'no '}  {llm.strip_thoughts(raw).strip()[:60]!r}")
+        except Exception as err:  # noqa: BLE001
+            print(f"  {json.dumps(body):70s} → ⚠️ {str(err)[:90]}")
+    print("Fastest row with thought=no  → set that JSON as LLM_EXTRA_BODY in .env / Render.")

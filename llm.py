@@ -33,14 +33,102 @@ API_KEY = (
     or "not-needed"  # Ollama ignores the key but the SDK wants a non-empty string
 ).strip()
 TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.4"))
-MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "2000"))
+MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "4096"))  # reasoning models spend tokens on thinking first
 # Some Gemma builds (e.g. Gemma 3 on the Gemini API) reject a `system` role.
 # Set FOLD_SYSTEM=1 to always merge the system prompt into the first user turn.
 FOLD_SYSTEM = os.getenv("FOLD_SYSTEM", "0") == "1"
 
 
+# Optional provider-specific request fields as JSON, e.g. to try switching off thinking:
+#   LLM_EXTRA_BODY={"reasoning_effort":"none"}
+#   LLM_EXTRA_BODY={"google":{"thinking_config":{"thinking_level":"minimal"}}}
+# If the provider rejects it (400), the request is retried once without it.
+try:
+    EXTRA_BODY = json.loads(os.getenv("LLM_EXTRA_BODY", "") or "null")
+except json.JSONDecodeError:
+    EXTRA_BODY = None
+
+
 class LLMError(RuntimeError):
     """Raised with a short, friendly message that the UI can show directly."""
+
+
+# ----------------------------------------------------------------------------- thinking filter
+# Reasoning models (Gemma 4, Qwen 3, DeepSeek-R1 …) may emit their chain of thought inline as
+# <thought>…</thought> or <think>…</think> before the answer. We never show that to the student.
+_OPEN_TAGS = ("<thought>", "<think>")
+_CLOSE_TAGS = ("</thought>", "</think>")
+_MAX_TAG = max(len(t) for t in _CLOSE_TAGS)
+
+
+def _find_first(text: str, tags) -> tuple[int, str]:
+    best, best_tag = -1, ""
+    for tag in tags:
+        i = text.find(tag)
+        if i != -1 and (best == -1 or i < best):
+            best, best_tag = i, tag
+    return best, best_tag
+
+
+def _partial_suffix(text: str, tags) -> int:
+    """Length of the longest suffix of `text` that is a proper prefix of one of `tags`."""
+    keep = 0
+    for tag in tags:
+        for k in range(min(len(tag) - 1, len(text)), 0, -1):
+            if text.endswith(tag[:k]):
+                keep = max(keep, k)
+                break
+    return keep
+
+
+class ThoughtFilter:
+    """Streaming-safe remover of <thought>/<think> blocks (tags may be split across chunks)."""
+
+    def __init__(self) -> None:
+        self.in_thought = False
+        self.saw_thought = False
+        self.buf = ""
+
+    def feed(self, chunk: str) -> str:
+        self.buf += chunk
+        out = ""
+        while True:
+            if self.in_thought:
+                i, tag = _find_first(self.buf, _CLOSE_TAGS)
+                if i == -1:
+                    self.buf = self.buf[-(_MAX_TAG - 1):]  # keep a tail in case the close tag is split
+                    return out
+                self.buf = self.buf[i + len(tag):].lstrip("\n")
+                self.in_thought = False
+            else:
+                i, tag = _find_first(self.buf, _OPEN_TAGS)
+                if i == -1:
+                    keep = _partial_suffix(self.buf, _OPEN_TAGS)
+                    cut = len(self.buf) - keep
+                    out += self.buf[:cut]
+                    self.buf = self.buf[cut:]
+                    return out
+                out += self.buf[:i]
+                self.buf = self.buf[i + len(tag):]
+                self.in_thought = self.saw_thought = True
+
+    def flush(self) -> str:
+        out = "" if self.in_thought else self.buf
+        self.buf = ""
+        return out
+
+
+def strip_thoughts(text: str) -> str:
+    f = ThoughtFilter()
+    out = f.feed(text) + f.flush()
+    if not out.strip() and f.saw_thought:
+        raise LLMError("Gemma sochte-sochte token limit cross kar gaya. Dobara try karo (ya LLM_MAX_TOKENS badhao).")
+    return out.lstrip("\n")
+
+
+def _retryable(err: Exception) -> bool:
+    low = str(err).lower()
+    return any(k in low for k in ("429", "rate", "quota", "500", "502", "503", "504", "internal", "overloaded", "unavailable", "timed out", "timeout"))
 
 
 def describe() -> str:
@@ -112,11 +200,18 @@ def _openai_chat(messages: List[Message], json_mode: bool, temperature: float, m
     kwargs = dict(model=MODEL, messages=messages, temperature=temperature, max_tokens=max_tokens, stream=stream)
     if json_mode:
         kwargs["response_format"] = {"type": "json_object"}
+    if EXTRA_BODY:
+        kwargs["extra_body"] = EXTRA_BODY
     try:
         return client.chat.completions.create(**kwargs)
     except Exception as err:  # noqa: BLE001 — we translate everything into LLMError
+        low = str(err).lower()
+        # 0) provider rejects our optional extra fields → retry without them
+        if "extra_body" in kwargs and ("400" in low or "invalid" in low or "unknown" in low or "reasoning" in low or "thinking" in low):
+            kwargs.pop("extra_body", None)
+            return client.chat.completions.create(**kwargs)
         # 1) provider doesn't support response_format → retry without it (prompt already asks for JSON)
-        if json_mode and ("response_format" in str(err).lower() or "json" in str(err).lower()):
+        if json_mode and ("response_format" in low or "json" in low):
             kwargs.pop("response_format", None)
             return client.chat.completions.create(**kwargs)
         # 2) provider rejects the system role → fold it into the user turn and retry once
@@ -192,8 +287,8 @@ def _mock_text(messages: List[Message], json_mode: bool) -> str:
 
 
 # ----------------------------------------------------------------------------- public API
-def chat(messages: List[Message], json_mode: bool = False, temperature: float | None = None, max_tokens: int | None = None) -> str:
-    """Return the full assistant reply as a string. Retries politely on rate limits."""
+def chat(messages: List[Message], json_mode: bool = False, temperature: float | None = None, max_tokens: int | None = None, strip: bool = True) -> str:
+    """Return the full assistant reply (thinking removed). Retries on rate limits and transient 5xx."""
     temperature = TEMPERATURE if temperature is None else temperature
     max_tokens = MAX_TOKENS if max_tokens is None else max_tokens
     if PROVIDER == "mock":
@@ -202,7 +297,7 @@ def chat(messages: List[Message], json_mode: bool = False, temperature: float | 
     if FOLD_SYSTEM and PROVIDER == "openai":
         messages = _fold_system(messages)
 
-    delays = (0, 3, 8)  # seconds between attempts
+    delays = (0, 4, 10)  # seconds between attempts
     last_err: Exception | None = None
     for delay in delays:
         if delay:
@@ -210,18 +305,35 @@ def chat(messages: List[Message], json_mode: bool = False, temperature: float | 
         try:
             if PROVIDER == "google":
                 resp = _google_chat(messages, json_mode, temperature, max_tokens, stream=False)
-                return resp.text or ""
-            resp = _openai_chat(messages, json_mode, temperature, max_tokens, stream=False)
-            return resp.choices[0].message.content or ""
+                text = resp.text or ""
+            else:
+                resp = _openai_chat(messages, json_mode, temperature, max_tokens, stream=False)
+                text = resp.choices[0].message.content or ""
+            return strip_thoughts(text) if strip else text
+        except LLMError:
+            raise
         except Exception as err:  # noqa: BLE001
             last_err = err
-            if "429" not in str(err) and "rate" not in str(err).lower():
+            if not _retryable(err):
                 break
     raise _friendly(last_err or RuntimeError("unknown error"))
 
 
+def _raw_stream(messages: List[Message], temperature: float, max_tokens: int) -> Iterator[str]:
+    if PROVIDER == "google":
+        for chunk in _google_chat(messages, False, temperature, max_tokens, stream=True):
+            if getattr(chunk, "text", None):
+                yield chunk.text
+        return
+    for chunk in _openai_chat(messages, False, temperature, max_tokens, stream=True):
+        if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
+            yield chunk.choices[0].delta.content
+
+
 def stream(messages: List[Message], temperature: float | None = None, max_tokens: int | None = None) -> Iterator[str]:
-    """Yield the reply token-by-token (falls back to one chunk when streaming isn't supported)."""
+    """Yield the visible reply as it arrives. While the model is still *thinking*, yields empty
+    strings so the UI can show a 'soch raha hai…' placeholder instead of the chain of thought.
+    Retries transient failures that happen before the first token."""
     temperature = TEMPERATURE if temperature is None else temperature
     max_tokens = MAX_TOKENS if max_tokens is None else max_tokens
     if PROVIDER == "mock":
@@ -232,20 +344,31 @@ def stream(messages: List[Message], temperature: float | None = None, max_tokens
         return
     if FOLD_SYSTEM and PROVIDER == "openai":
         messages = _fold_system(messages)
-    try:
-        if PROVIDER == "google":
-            for chunk in _google_chat(messages, False, temperature, max_tokens, stream=True):
-                if getattr(chunk, "text", None):
-                    yield chunk.text
+
+    delays = (0, 4, 10)
+    last_err: Exception | None = None
+    for delay in delays:
+        if delay:
+            time.sleep(delay)
+        filt, got_any = ThoughtFilter(), False
+        try:
+            for raw in _raw_stream(messages, temperature, max_tokens):
+                got_any = True
+                yield filt.feed(raw)  # "" while inside a thought block
+            tail = filt.flush()
+            if tail:
+                yield tail
+            if filt.saw_thought and not got_any:
+                raise LLMError("Model se khaali jawab aaya. Dobara try karo.")
             return
-        for chunk in _openai_chat(messages, False, temperature, max_tokens, stream=True):
-            if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
-                yield chunk.choices[0].delta.content
-    except LLMError:
-        raise
-    except Exception as err:  # noqa: BLE001
-        # Some endpoints don't stream; try once more without streaming.
-        if "stream" in str(err).lower():
-            yield chat(messages, False, temperature, max_tokens)
-            return
-        raise _friendly(err)
+        except LLMError:
+            raise
+        except Exception as err:  # noqa: BLE001
+            last_err = err
+            if got_any or not _retryable(err):
+                break
+    # Some endpoints don't stream at all; try once more without streaming.
+    if last_err and "stream" in str(last_err).lower():
+        yield chat(messages, False, temperature, max_tokens)
+        return
+    raise _friendly(last_err or RuntimeError("unknown error"))

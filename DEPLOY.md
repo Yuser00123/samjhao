@@ -76,3 +76,12 @@ Test from your phone. In Chrome → ⋮ → **Add to Home Screen** — it instal
 ## 5. Backup host (only if Render is down for you)
 
 Hugging Face Spaces (Gradio SDK): create a Space → upload all `.py` files + `requirements.txt` → Settings → **Secrets** → add `LLM_API_KEY`, `FRIEND_NAME`, `FRIEND_EXAM`. Works identically — but then don't claim *Best Use of Render* in the post.
+
+## Health check & reasoning models
+
+* Render → your service → **Settings → Health Check Path** = `/health` (the Blueprint `render.yaml` already sets this).
+  `GET /health` returns `{"status":"ok","service":"samjhao","model":…,"uptime_seconds":…}` — point a free uptime pinger at it so the free instance stays warm.
+* Gemma 4 is a *reasoning* model: it thinks before it answers (20–60 s on the free tier) and the Gemini
+  OpenAI-compatible endpoint returns those thoughts inline as `<thought>…</thought>`. Samjhao strips them
+  and shows a "🤔 Gemma soch raha hai…" timer instead. Transient Google `500 Internal error` responses are retried automatically.
+  To experiment with switching thinking off: `python test_llm.py --probe-thinking` and set the winning JSON as `LLM_EXTRA_BODY`.

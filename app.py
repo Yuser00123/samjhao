@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import time
 from pathlib import Path
 
 # Load .env without a hard dependency on python-dotenv
@@ -113,11 +114,17 @@ def do_explain(text, pdf_path, start_page, max_pages, depth, style, diary):
         return
 
     header = f"> {info}\n\n" if info else ""
-    out = ""
+    out, t0, shown = "", time.time(), -1
     try:
         for chunk in llm.stream(P.explain_prompt(content, depth, style)):
             out += chunk
-            yield header + out, content, *_diary_outputs(diary)
+            if out:
+                yield header + out, content, *_diary_outputs(diary)
+            else:  # model is still thinking — show elapsed time, never the chain of thought
+                secs = int(time.time() - t0)
+                if secs != shown:
+                    shown = secs
+                    yield header + f"🤔 *Gemma soch raha hai… {secs}s* — pehli line aate hi yahan dikhegi.", content, *_diary_outputs(diary)
     except llm.LLMError as err:
         yield header + out + f"\n\n⚠️ {err}", content, *_diary_outputs(diary)
         return
@@ -343,8 +350,6 @@ with gr.Blocks(title="Samjhao") as demo:
 # ----------------------------------------------------------------------------- server
 # Gradio runs on FastAPI. We mount it on our own FastAPI app so we can add plain HTTP
 # endpoints next to the UI — e.g. /health for Render's health checks and uptime monitors.
-import time  # noqa: E402
-
 from fastapi import FastAPI  # noqa: E402
 
 STARTED_AT = time.time()
