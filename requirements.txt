@@ -1,0 +1,5 @@
+gradio>=6.0,<7
+openai>=1.50
+pypdf>=5.0
+# Optional: only if you set LLM_PROVIDER=google (native Gemini SDK)
+# google-genai>=1.0
