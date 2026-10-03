@@ -126,6 +126,11 @@ def strip_thoughts(text: str) -> str:
     return out.lstrip("\n")
 
 
+def _log(msg: str) -> None:
+    if os.getenv("LLM_QUIET", "").lower() not in ("1", "true", "yes"):
+        print(f"[llm] {msg}", flush=True)
+
+
 def _retryable(err: Exception) -> bool:
     low = str(err).lower()
     return any(k in low for k in ("429", "rate", "quota", "500", "502", "503", "504", "internal", "overloaded", "unavailable", "timed out", "timeout"))
@@ -299,35 +304,63 @@ def chat(messages: List[Message], json_mode: bool = False, temperature: float | 
 
     delays = (0, 4, 10)  # seconds between attempts
     last_err: Exception | None = None
-    for delay in delays:
+    for attempt, delay in enumerate(delays, 1):
         if delay:
             time.sleep(delay)
+        t0 = time.time()
         try:
             if PROVIDER == "google":
                 resp = _google_chat(messages, json_mode, temperature, max_tokens, stream=False)
-                text = resp.text or ""
+                text, finish = resp.text or "", None
             else:
                 resp = _openai_chat(messages, json_mode, temperature, max_tokens, stream=False)
-                text = resp.choices[0].message.content or ""
-            return strip_thoughts(text) if strip else text
-        except LLMError:
-            raise
+                text, finish = resp.choices[0].message.content or "", resp.choices[0].finish_reason
+            visible = strip_thoughts(text) if strip else text
+            _log(f"chat attempt={attempt} {time.time() - t0:.1f}s raw={len(text)} visible={len(visible.strip())} finish={finish}")
+            if visible.strip():
+                return visible
+            last_err = LLMError("Model se khaali jawab aaya. Dobara try karo.")
+        except LLMError as err:  # e.g. thought block ate the whole token budget → retry (sampling differs)
+            _log(f"chat attempt={attempt} {time.time() - t0:.1f}s empty: {err}")
+            last_err = err
         except Exception as err:  # noqa: BLE001
+            _log(f"chat attempt={attempt} {time.time() - t0:.1f}s error={str(err)[:160]!r}")
             last_err = err
             if not _retryable(err):
                 break
+    if isinstance(last_err, LLMError):
+        raise last_err
     raise _friendly(last_err or RuntimeError("unknown error"))
 
 
-def _raw_stream(messages: List[Message], temperature: float, max_tokens: int) -> Iterator[str]:
+def _raw_stream(messages: List[Message], temperature: float, max_tokens: int):
+    """Yield raw text deltas; *returns* the provider's finish_reason (None if unknown)."""
+    finish = None
     if PROVIDER == "google":
         for chunk in _google_chat(messages, False, temperature, max_tokens, stream=True):
             if getattr(chunk, "text", None):
                 yield chunk.text
-        return
+            try:
+                finish = str(chunk.candidates[0].finish_reason).split(".")[-1].lower()
+            except Exception:  # noqa: BLE001
+                pass
+        return finish
     for chunk in _openai_chat(messages, False, temperature, max_tokens, stream=True):
-        if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
-            yield chunk.choices[0].delta.content
+        if chunk.choices:
+            choice = chunk.choices[0]
+            if choice.delta and choice.delta.content:
+                yield choice.delta.content
+            if choice.finish_reason:
+                finish = choice.finish_reason
+    return finish
+
+
+def _empty_reason(filt: "ThoughtFilter", finish: str | None, got_any: bool) -> str:
+    if finish in ("length", "max_tokens") or filt.in_thought:
+        return "Gemma sochte-sochte token limit cross kar gaya. Dobara try karo (ya LLM_MAX_TOKENS badhao)."
+    if not got_any:
+        return "Model se khaali jawab aaya (provider ne kuch bheja hi nahi). Dobara try karo."
+    return "Model ne sirf sochne me jawab khatam kar diya 🤔 — dobara try karo."
 
 
 def stream(messages: List[Message], temperature: float | None = None, max_tokens: int | None = None) -> Iterator[str]:
@@ -347,26 +380,40 @@ def stream(messages: List[Message], temperature: float | None = None, max_tokens
 
     delays = (0, 4, 10)
     last_err: Exception | None = None
-    for delay in delays:
+    for attempt, delay in enumerate(delays, 1):
         if delay:
             time.sleep(delay)
-        filt, got_any = ThoughtFilter(), False
+        filt, got_any, visible, finish, t0 = ThoughtFilter(), False, False, None, time.time()
         try:
-            for raw in _raw_stream(messages, temperature, max_tokens):
+            gen = _raw_stream(messages, temperature, max_tokens)
+            while True:
+                try:
+                    raw = next(gen)
+                except StopIteration as stop:
+                    finish = stop.value
+                    break
                 got_any = True
-                yield filt.feed(raw)  # "" while inside a thought block
+                piece = filt.feed(raw)
+                visible = visible or bool(piece.strip())
+                yield piece  # "" while inside a thought block
             tail = filt.flush()
             if tail:
+                visible = True
                 yield tail
-            if filt.saw_thought and not got_any:
-                raise LLMError("Model se khaali jawab aaya. Dobara try karo.")
-            return
+            _log(f"stream attempt={attempt} {time.time() - t0:.1f}s chunks={'yes' if got_any else 'no'} "
+                 f"thought={'yes' if filt.saw_thought else 'no'} visible={'yes' if visible else 'NO'} finish={finish}")
+            if visible:
+                return
+            last_err = LLMError(_empty_reason(filt, finish, got_any))  # sampled output → a retry usually works
         except LLMError:
             raise
         except Exception as err:  # noqa: BLE001
+            _log(f"stream attempt={attempt} {time.time() - t0:.1f}s error={str(err)[:160]!r}")
             last_err = err
-            if got_any or not _retryable(err):
+            if visible or not _retryable(err):
                 break
+    if isinstance(last_err, LLMError):
+        raise last_err
     # Some endpoints don't stream at all; try once more without streaming.
     if last_err and "stream" in str(last_err).lower():
         yield chat(messages, False, temperature, max_tokens)
