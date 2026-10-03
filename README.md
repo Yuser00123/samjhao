@@ -54,6 +54,12 @@ LLM_API_KEY=ollama
 
 Free instances sleep after 15 min of inactivity; the first request after that takes ~30–60 s. Tell your friend. 🙂
 
+## Screenshots
+
+| Samjhao (explain) | Quiz + check | Doubt Diary |
+|---|---|---|
+| ![Explanation of the work-energy theorem in Hinglish with rendered formulas](docs/screenshots/01-explain.png) | ![Five-question Hinglish quiz with score and per-question explanations](docs/screenshots/02-quiz.png) | ![Doubt Diary table with revision test and download buttons](docs/screenshots/03-diary.png) |
+
 ## Features
 
 - **`GET /health`** — liveness probe returning `{"status": "ok", "service": "samjhao", "model": "…", "uptime_seconds": n}`; used by Render's health check (`healthCheckPath` in `render.yaml`) and handy for uptime monitors.
