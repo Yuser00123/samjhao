@@ -6,6 +6,7 @@ Run:  python app.py          (reads .env if present)
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 import time
 from pathlib import Path
@@ -105,6 +106,22 @@ def _diary_outputs(diary):
 
 
 # ----------------------------------------------------------------------------- handlers
+LATEX = [  # Gemma writes JEE formulas as $...$ — render them instead of showing raw TeX
+    {"left": "$$", "right": "$$", "display": True},
+    {"left": "$", "right": "$", "display": False},
+]
+_TOPIC_LINE = re.compile(r"^[ \t]*\**[ \t]*TOPIC[ \t]*:[ \t]*\**[ \t]*(.+?)[ \t]*\**[ \t]*$", re.IGNORECASE | re.MULTILINE)
+
+
+def _pretty(md: str):
+    """Turn the model's leading 'TOPIC: X' line into a heading; return (markdown, topic or None)."""
+    m = _TOPIC_LINE.search(md[:200])
+    if not m:
+        return md, None
+    title = m.group(1).strip().strip("*").strip()
+    return md[: m.start()] + f"### 📌 {title}" + md[m.end():], title
+
+
 def do_explain(text, pdf_path, start_page, max_pages, depth, style, diary):
     """Streams the explanation, then logs it in the diary."""
     try:
@@ -119,20 +136,21 @@ def do_explain(text, pdf_path, start_page, max_pages, depth, style, diary):
         for chunk in llm.stream(P.explain_prompt(content, depth, style)):
             out += chunk
             if out:
-                yield header + out, content, *_diary_outputs(diary)
+                yield header + _pretty(out)[0], content, *_diary_outputs(diary)
             else:  # model is still thinking — show elapsed time, never the chain of thought
                 secs = int(time.time() - t0)
                 if secs != shown:
                     shown = secs
                     yield header + f"🤔 *Gemma soch raha hai… {secs}s* — pehli line aate hi yahan dikhegi.", content, *_diary_outputs(diary)
     except llm.LLMError as err:
-        yield header + out + f"\n\n⚠️ {err}", content, *_diary_outputs(diary)
+        yield header + _pretty(out)[0] + f"\n\n⚠️ {err}", content, *_diary_outputs(diary)
         return
     except Exception as err:  # noqa: BLE001
-        yield header + out + f"\n\n⚠️ Kuch gadbad hui: {str(err)[:200]}", content, *_diary_outputs(diary)
+        yield header + _pretty(out)[0] + f"\n\n⚠️ Kuch gadbad hui: {str(err)[:200]}", content, *_diary_outputs(diary)
         return
 
-    diary = D.add(diary, kind="explain", topic=guess_topic(content), depth=depth, style=style)
+    out, title = _pretty(out)
+    diary = D.add(diary, kind="explain", topic=title or guess_topic(content), depth=depth, style=style)
     yield header + out, content, *_diary_outputs(diary)
 
 
@@ -286,7 +304,7 @@ with gr.Blocks(title="Samjhao") as demo:
             with gr.Row():
                 explain_btn = gr.Button("Samjhao 🙏", variant="primary", scale=2)
                 quiz_btn = gr.Button("Quiz banao 📝", variant="secondary", scale=1)
-            explain_out = gr.Markdown(elem_id="explain-out")
+            explain_out = gr.Markdown(elem_id="explain-out", latex_delimiters=LATEX)
             gr.Examples(EXAMPLES, inputs=[text_in, depth, style], label="Try karo")
 
         # ------------------------------------------------------------------ Quiz
@@ -294,7 +312,7 @@ with gr.Blocks(title="Samjhao") as demo:
             quiz_title = gr.Markdown("Pehle 'Samjhao' tab me kuch samjho, phir **Quiz banao** dabao — ya Diary se **Revision test** lo.")
             radios = [gr.Radio(choices=[], label="", type="index", visible=False) for _ in range(N_Q)]
             check_btn = gr.Button("Check karo ✅", variant="primary")
-            quiz_result = gr.Markdown(elem_id="quiz-result")
+            quiz_result = gr.Markdown(elem_id="quiz-result", latex_delimiters=LATEX)
 
         # ------------------------------------------------------------------ Diary
         with gr.Tab("📓 Doubt Diary", id="diary"):
